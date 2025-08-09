@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>キャッチャーミット位置入力</title>
+  <style>
+    body { background: #111; color: #eaeaea; font-family: sans-serif; margin: 0; }
+    .wrap { max-width: 960px; margin: 24px auto; padding: 16px; }
+    h1 { font-size: 20px; margin-bottom: 12px; }
+    .board { display: grid; grid-template-columns: 1fr 300px; gap: 16px; }
+    .stage, .panel { background: #1b1b1b; border-radius: 16px; padding: 12px; }
+    button { border: none; border-radius: 8px; padding: 8px 12px; cursor: pointer; font-weight: bold; }
+    .primary { background: #4caf50; color: #fff; }
+    .ghost { background: #333; color: #fff; }
+    .danger { background: #ef5350; color: #fff; }
+    svg { width: 100%; height: auto; background: #121212; border-radius: 8px; touch-action: none; }
+    input[type="text"] { width: 100%; padding: 8px; background: #161616; border: 1px solid #333; color: #eaeaea; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 4px; border-bottom: 1px solid #333; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    .tick { stroke: #2a2a2a; }
+    .axis { stroke: #3e3e3e; }
+    .tick-label { font-size: 10px; fill: #a9a9a9; user-select: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>キャッチャーミット位置入力 <span id="pitchCount">0 件</span></h1>
+    <div class="board">
+      <div class="stage">
+        <svg id="zone" viewBox="0 0 400 450" preserveAspectRatio="xMidYMid meet" aria-label="strike-zone-board">
+          <rect x="0" y="0" width="400" height="450" fill="#121212" />
+          <!-- グリッド/ゾーン/ホームベースはJSで描画 -->
+          <polygon id="plate" fill="none" stroke="#d9d9d9" stroke-width="2" stroke-linejoin="round" />
+          <image id="mittPreview" href="mitt.png" x="-100" y="-100" width="60" height="60" visibility="hidden" style="pointer-events:none" />
+        </svg>
+
+        <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+          <button type="button" class="primary" id="confirmBtn">確定（次へ）</button>
+          <button type="button" class="ghost" id="undoBtn">ひとつ戻す</button>
+          <button type="button" class="danger" id="clearBtn">全消去</button>
+        </div>
+        <div style="margin-top:6px; font-size:12px; color:#bdbdbd;">
+          ※ 座標系：左が＋／右が−、原点=ホームベース中心(0,0)、yは上方向が＋。<br>
+          入力範囲：x = -1.0〜+1.0 m、y = -0.3〜+1.5 m。
+        </div>
+      </div>
+
+      <div class="panel">
+        <label>ファイル名</label>
+        <input id="filename" type="text" value="mitt_points.csv" />
+        <div style="margin-top:8px;">
+          <button type="button" class="primary" id="finishBtn">入力終了（CSVダウンロード）</button>
+        </div>
+        <table style="margin-top:12px;">
+          <thead><tr><th>#</th><th>x_m</th><th>y_m</th></tr></thead>
+          <tbody id="preview"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const svg = document.getElementById('zone');
+  const plateEl = document.getElementById('plate');
+  const mittPreview = document.getElementById('mittPreview');
+  const confirmBtn = document.getElementById('confirmBtn');
+  const undoBtn = document.getElementById('undoBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const finishBtn = document.getElementById('finishBtn');
+  const filenameEl = document.getElementById('filename');
+  const previewBody = document.getElementById('preview');
+  const pitchCountEl = document.getElementById('pitchCount');
+
+  // 画面サイズ（px）
+  const viewW = 400, viewH = 450;
+
+  // ストライクゾーンの物理境界（m）— 左＋／右−
+  const zoneLeft   = +0.3048;
+  const zoneRight  = -0.3048;
+  const zoneTop    = 1.0027;
+  const zoneBottom = 0.4574;
+
+  // 原点（ホームベース中心）の画面座標（px）
+  const cx = 200;   // 中央
+  const cy = 390;   // 下寄り（視認性のため）
+
+  // ゾーン横幅を基準にスケール（px/m）（x・y共通）
+  const desiredZoneWidthPx = 180; // 見た目の調整パラメータ
+  const scale = desiredZoneWidthPx / (zoneLeft - zoneRight); // 0.6096mで割る
+
+  // 実座標↔px 変換（左＋/右−、上＋/下−）
+  function metersToPxX(x_m){ return cx - x_m * scale; }
+  function metersToPxY(y_m){ return cy - y_m * scale; }
+  function pxToMeters(x_px, y_px){ return { x_m:(cx - x_px)/scale, y_m:(cy - y_px)/scale }; }
+
+  // 入力許容範囲（m）
+  const xMinM = -1.0, xMaxM = +1.0;
+  const yMinM = -0.3, yMaxM = +1.5;
+
+  // --- ストライクゾーン枠（厳密一致で描画） ---
+  function drawStrikeZone(){
+    const NS = 'http://www.w3.org/2000/svg';
+    let zoneRect = document.getElementById('zoneRect');
+    if(!zoneRect){
+      zoneRect = document.createElementNS(NS, 'rect');
+      zoneRect.setAttribute('id', 'zoneRect');
+      zoneRect.setAttribute('fill', 'none');
+      zoneRect.setAttribute('stroke', '#d9d9d9');
+      zoneRect.setAttribute('stroke-width', '2.5');
+      svg.appendChild(zoneRect);
+    }
+    const xL = metersToPxX(zoneLeft);
+    const xR = metersToPxX(zoneRight);
+    const yT = metersToPxY(zoneTop);
+    const yB = metersToPxY(zoneBottom);
+    zoneRect.setAttribute('x', Math.min(xL, xR));
+    zoneRect.setAttribute('y', Math.min(yT, yB));
+    zoneRect.setAttribute('width', Math.abs(xR - xL));
+    zoneRect.setAttribute('height', Math.abs(yB - yT));
+  }
+
+  // --- ホームベース（尖りが“奥＝上側”／下辺の幅＝ストライクゾーン幅） ---
+  function drawHomePlate(){
+    // ゾーン幅(px)＝±0.3048mの距離
+    const zoneWidthPx = Math.abs(metersToPxX(zoneLeft) - metersToPxX(zoneRight));
+    const half = zoneWidthPx / 2;
+
+    // 先端（投手側）を上に、水平の“下辺”をゾーン幅に一致させる
+    const bottomY = cy + 8;   // 下辺（キャッチャー側）※見た目の厚み調整
+    const midY    = cy;       // 斜辺の接続位置
+    const tipY    = cy - 18;  // 先端（投手側／奥）
+
+    const pts = [
+      [cx - half, bottomY], // 左下（下辺左端）
+      [cx + half, bottomY], // 右下（下辺右端）
+      [cx + half, midY],    // 右中
+      [cx,       tipY],     // 上の尖り（奥）
+      [cx - half, midY],    // 左中
+    ];
+    document.getElementById('plate')
+      .setAttribute('points', pts.map(p => p.join(',')).join(' '));
+  }
+
+  // --- 数値付きグリッド（縦0.5m・横0.2m、表示範囲＝入力範囲） ---
+  function drawGrid(){
+    const NS = 'http://www.w3.org/2000/svg';
+    const old = document.getElementById('grid');
+    if (old) old.remove();
+
+    const g = document.createElementNS(NS, 'g');
+    g.setAttribute('id', 'grid');
+    svg.insertBefore(g, svg.firstElementChild.nextSibling);
+
+    // 軸（x=0, y=0）
+    const xAxis = document.createElementNS(NS, 'line');
+    xAxis.setAttribute('x1', 0); xAxis.setAttribute('x2', viewW);
+    xAxis.setAttribute('y1', cy); xAxis.setAttribute('y2', cy);
+    xAxis.setAttribute('class', 'axis'); xAxis.setAttribute('stroke-width', '1');
+    g.appendChild(xAxis);
+
+    const yAxis = document.createElementNS(NS, 'line');
+    yAxis.setAttribute('x1', cx); yAxis.setAttribute('x2', cx);
+    yAxis.setAttribute('y1', 0);  yAxis.setAttribute('y2', viewH);
+    yAxis.setAttribute('class', 'axis'); yAxis.setAttribute('stroke-width', '1');
+    g.appendChild(yAxis);
+
+    // 表示範囲（m）＝入力範囲
+    const xMin = xMinM, xMax = xMaxM;
+    const yMin = yMinM, yMax = yMaxM;
+
+    // 縦線（x一定：0.5m刻み）
+    const xStep = 0.5;
+    for(let x = Math.ceil(xMin/xStep)*xStep; x <= xMax + 1e-9; x += xStep){
+      if (Math.abs(x) < 1e-9) continue; // y軸は別描画
+      const xpx = metersToPxX(x);
+      const line = document.createElementNS(NS, 'line');
+      line.setAttribute('x1', xpx); line.setAttribute('x2', xpx);
+      line.setAttribute('y1', 0);   line.setAttribute('y2', viewH);
+      line.setAttribute('class', 'tick'); line.setAttribute('stroke-width', '1');
+      g.appendChild(line);
+
+      const label = document.createElementNS(NS, 'text');
+      label.setAttribute('x', xpx);
+      label.setAttribute('y', viewH - 6);
+      label.setAttribute('text-anchor', 'middle');
+      label.setAttribute('class', 'tick-label');
+      const sign = x > 0 ? '+' : ''; // 左が＋、右が−
+      label.textContent = `${sign}${x.toFixed(1)}m`;
+      g.appendChild(label);
+    }
+
+    // 横線（y一定：0.2m刻み）
+    const yStep = 0.2;
+    for(let y = Math.ceil(yMin/yStep)*yStep; y <= yMax + 1e-9; y += yStep){
+      if (Math.abs(y) < 1e-9) continue; // x軸は別描画
+      const ypx = metersToPxY(y);
+      const line = document.createElementNS(NS, 'line');
+      line.setAttribute('x1', 0);   line.setAttribute('x2', viewW);
+      line.setAttribute('y1', ypx); line.setAttribute('y2', ypx);
+      line.setAttribute('class', 'tick'); line.setAttribute('stroke-width', '1');
+      g.appendChild(line);
+
+      const label = document.createElementNS(NS, 'text');
+      label.setAttribute('x', viewW - 4);
+      label.setAttribute('y', ypx - 2);
+      label.setAttribute('text-anchor', 'end');
+      label.setAttribute('class', 'tick-label');
+      label.textContent = `${y.toFixed(1)}m`;
+      g.appendChild(label);
+    }
+
+    // 原点(0,0)ラベル
+    const origin = document.createElementNS(NS, 'text');
+    origin.setAttribute('x', cx + 4);
+    origin.setAttribute('y', cy - 4);
+    origin.setAttribute('class', 'tick-label');
+    origin.textContent = '(0,0)';
+    g.appendChild(origin);
+  }
+
+  // --- 入力点のプレビュー＆保存 ---
+  let hover = null;
+  let data = [];
+
+  function getSVGPoint(evt){
+    const pt = svg.createSVGPoint();
+    pt.x = evt.clientX; pt.y = evt.clientY;
+    const ctm = svg.getScreenCTM().inverse();
+    const p = pt.matrixTransform(ctm);
+
+    // m範囲→pxに変換してクランプ（左右-1.0〜+1.0、縦-0.3〜+1.5）
+    const xMinPx = metersToPxX(xMaxM); // 左端（＋側）
+    const xMaxPx = metersToPxX(xMinM); // 右端（−側）
+    const yMinPx = metersToPxY(yMaxM); // 上端（＋側）
+    const yMaxPx = metersToPxY(yMinM); // 下端（−側）
+
+    const x = Math.max(xMinPx, Math.min(xMaxPx, p.x));
+    const y = Math.max(yMinPx, Math.min(yMaxPx, p.y));
+    return { x, y };
+  }
+
+  function updateCursor(){
+    if(!hover){ mittPreview.setAttribute('visibility','hidden'); return; }
+    mittPreview.setAttribute('visibility','visible');
+    // 画像サイズを 50x50 にしたので半径は 25px
+    mittPreview.setAttribute('x', hover.x - 30);
+    mittPreview.setAttribute('y', hover.y - 30);
+  }
+
+  function redrawPreview(){
+    pitchCountEl.textContent = data.length + ' 件';
+    previewBody.innerHTML = data.map((d,i)=>
+      `<tr><td>${i+1}</td><td>${d.x_m.toFixed(4)}</td><td>${d.y_m.toFixed(4)}</td></tr>`
+    ).join('');
+  }
+
+  // 初期描画
+  drawGrid();
+  drawStrikeZone();
+  drawHomePlate();
+
+  // 操作
+  svg.addEventListener('click', (e)=>{ hover = getSVGPoint(e); updateCursor(); });
+
+  confirmBtn.addEventListener('click', ()=>{
+    if(!hover){ alert('位置をクリックしてください'); return; }
+    const {x_m, y_m} = pxToMeters(hover.x, hover.y);
+    data.push({x_m, y_m});
+    hover = null; updateCursor(); redrawPreview();
+  });
+
+  undoBtn.addEventListener('click', ()=>{ data.pop(); redrawPreview(); });
+
+  clearBtn.addEventListener('click', ()=>{
+    if(confirm('削除しますか？')){ data=[]; hover=null; updateCursor(); redrawPreview(); }
+  });
+
+  finishBtn.addEventListener('click', ()=>{
+    if(data.length===0){ alert('データなし'); return; }
+    const csv = ['pitch,x_m,y_m', ...data.map((d,i)=>`${i+1},${d.x_m},${d.y_m}`)].join('\n');
+    const blob = new Blob([csv], {type:'text/csv'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filenameEl.value || 'mitt_points.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+</body>
+</html>
